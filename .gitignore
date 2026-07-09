@@ -1,0 +1,38 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Generated experiment outputs
+outputs/
+reports/
+models/
+
+# Generated/intermediate data
+data/processed/
+data/interim/
+
+# Data not used by the final no-RF teaching script
+data/raw/im_60m/china_10y_yield.csv
+data/raw/im_60m/IM_real_20220722_20260630.csv
+data/raw/im_60m/IM_yaun_20220722_20260630.csv
+data/raw/im_60m/jiaoben.py
+data/raw/im_60m/if_60/
+
+# Old local research scripts that are not part of the final teaching version
+src/
+tests/
+joinquant_im_60m_macd_anchor_outer20.py
+jvkuan.PY

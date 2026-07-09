@@ -1,0 +1,2 @@
+symbol,multiplier,margin_rate,open_commission,close_commission,close_today_commission,slippage_points_per_side,tick_size
+IM,200,0.16,0.000023,0.000023,0.00023,0.4,0.2
