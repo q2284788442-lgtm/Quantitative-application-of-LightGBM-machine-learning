@@ -2,12 +2,13 @@
 Final no-RF LightGBM teaching example.
 
 This script builds daily 000852.XSHG index features, trains one LightGBM
-classifier with a fixed parameter set, and backtests the signal on IM
-current-month continuous futures data.
+classifier with a fixed parameter set, writes the latest live signal, and
+backtests the training-period signal on IM current-month continuous futures data.
 
 Rules:
-  - Train targets end at 2025-06-30.
-  - 2025-07-01 to 2026-06-30 is an observed retrospective OOS period.
+  - Daily training uses all complete labeled rows whose target exit date
+    is not later than the latest available feature date.
+  - The latest complete feature row is also scored as the live signal.
   - No China 10Y yield file or interest-rate feature is used.
   - The label uses T+1 open to T+2 open return, aligned with the
     open-rebalance state-holding futures strategy.
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Dict, Iterable, List
 
@@ -39,10 +41,8 @@ META_FILE = ROOT / "data" / "metadata" / "futures_contract_meta.csv"
 OUT_DIR = ROOT / "outputs" / "final_lightgbm_im_daily_static_no_rf"
 
 INDEX_CODE = "000852.XSHG"
-TRAIN_TARGET_END = pd.Timestamp("2025-06-30")
-OOS_TARGET_START = pd.Timestamp("2025-07-01")
-OOS_TARGET_END = pd.Timestamp("2026-06-30")
 INITIAL_CASH = 1_000_000.0
+MIN_CHILD_SAMPLES_RATE = Decimal("0.025")
 
 PARAMS = {
     "objective": "binary",
@@ -102,7 +102,11 @@ class ContractMeta:
 
 
 def json_default(obj):
+    if obj is pd.NaT:
+        return None
     if isinstance(obj, (pd.Timestamp, np.datetime64)):
+        if pd.isna(obj):
+            return None
         return pd.Timestamp(obj).isoformat()
     if isinstance(obj, (np.integer,)):
         return int(obj)
@@ -115,9 +119,54 @@ def json_default(obj):
     raise TypeError(f"{type(obj).__name__} is not JSON serializable")
 
 
+def json_sanitize(obj):
+    if obj is pd.NaT:
+        return None
+    if isinstance(obj, dict):
+        return {str(key): json_sanitize(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_sanitize(value) for value in obj]
+    if isinstance(obj, np.ndarray):
+        return [json_sanitize(value) for value in obj.tolist()]
+    if isinstance(obj, (pd.Timestamp, np.datetime64)):
+        if pd.isna(obj):
+            return None
+        return pd.Timestamp(obj).isoformat()
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating, float)):
+        if pd.isna(obj) or not np.isfinite(obj):
+            return None
+        return float(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    try:
+        if pd.isna(obj):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return obj
+
+
 def write_json(path: Path, data: Dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=json_default), encoding="utf-8")
+    path.write_text(
+        json.dumps(json_sanitize(data), ensure_ascii=False, indent=2, allow_nan=False, default=json_default),
+        encoding="utf-8",
+    )
+
+
+def calc_min_child_samples(train_rows: int) -> int:
+    if train_rows <= 0:
+        raise ValueError("Cannot calculate min_child_samples for an empty training set.")
+    value = Decimal(train_rows) * MIN_CHILD_SAMPLES_RATE
+    return max(1, int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP)))
+
+
+def training_params(train_rows: int) -> Dict[str, object]:
+    params = dict(PARAMS)
+    params["min_child_samples"] = calc_min_child_samples(train_rows)
+    return params
 
 
 def rsi(close: pd.Series, window: int) -> pd.Series:
@@ -276,6 +325,27 @@ def predict(model: lgb.LGBMClassifier, rows: pd.DataFrame) -> pd.DataFrame:
         previous = target
     out["target_position"] = targets
     return out
+
+
+def latest_complete_feature_rows(panel: pd.DataFrame) -> pd.DataFrame:
+    complete = panel[panel["feature_complete"].eq(1)].copy()
+    if complete.empty:
+        raise ValueError("No complete feature row is available for latest prediction.")
+    latest_feature_date = complete["feature_date"].max()
+    return complete[complete["feature_date"].eq(latest_feature_date)].copy()
+
+
+def predict_latest_signal(model: lgb.LGBMClassifier, panel: pd.DataFrame) -> pd.DataFrame:
+    latest_rows = latest_complete_feature_rows(panel)
+    signal = predict(model, latest_rows)
+    signal["prediction_horizon"] = "next_trading_open_to_second_next_trading_open"
+    signal["direction"] = np.select(
+        [signal["target_position"].eq(1), signal["target_position"].eq(-1)],
+        ["up_or_long", "down_or_short"],
+        default="flat",
+    )
+    signal["is_labeled_training_row"] = signal["target_up"].notna()
+    return signal
 
 
 def safe_auc(y: Iterable[int], p: Iterable[float]) -> float:
@@ -536,35 +606,38 @@ def main() -> None:
     panel = build_feature_panel(load_index_data())
     im_daily = load_im_daily_execution()
 
-    train = select_rows(panel, start=None, end=TRAIN_TARGET_END)
-    oos = select_rows(panel, start=OOS_TARGET_START, end=OOS_TARGET_END)
-    if train.empty or oos.empty:
-        raise ValueError("Train or OOS sample is empty.")
-    if train["target_exit_date"].max() > TRAIN_TARGET_END:
-        raise ValueError("Training data crosses into observed OOS.")
+    latest_feature_rows = latest_complete_feature_rows(panel)
+    latest_feature_date = pd.Timestamp(latest_feature_rows["feature_date"].max())
+    train_target_end = latest_feature_date
+    train = select_rows(panel, start=None, end=train_target_end)
+    if train.empty:
+        raise ValueError("Train sample is empty.")
+    if train["target_exit_date"].max() > train_target_end:
+        raise ValueError("Training data uses a target after the latest available feature date.")
 
-    model = lgb.LGBMClassifier(**PARAMS)
+    active_params = training_params(len(train))
+    model = lgb.LGBMClassifier(**active_params)
     model.fit(train[FEATURE_COLUMNS].astype(float), train["target_up"].astype(int))
     train_pred = predict(model, train)
-    oos_pred = predict(model, oos)
+    latest_signal = predict_latest_signal(model, panel)
 
     train_execution = im_daily[
-        im_daily["trade_date"].between(pd.Timestamp("2022-07-22"), TRAIN_TARGET_END)
+        im_daily["trade_date"].between(pd.Timestamp("2022-07-22"), train_target_end)
     ].copy()
-    oos_execution = im_daily[im_daily["trade_date"].between(OOS_TARGET_START, OOS_TARGET_END)].copy()
     train_result = run_sample("train", train_execution, train_pred, meta)
-    oos_result = run_sample("observed_oos", oos_execution, oos_pred, meta)
 
     train_pred.to_csv(OUT_DIR / "train_predictions.csv", index=False, encoding="utf-8")
-    oos_pred.to_csv(OUT_DIR / "oos_predictions.csv", index=False, encoding="utf-8")
-    for label, result in [("train", train_result), ("oos", oos_result)]:
-        result["curves"].to_csv(OUT_DIR / f"{label}_equity_curve.csv", index=False, encoding="utf-8")
-        result["trades"].to_csv(OUT_DIR / f"{label}_trade_log.csv", index=False, encoding="utf-8")
-        result["monthly"].to_csv(OUT_DIR / f"{label}_monthly_returns.csv", index=False, encoding="utf-8")
-        result["metrics"].to_csv(OUT_DIR / f"{label}_metrics.csv", index=False, encoding="utf-8")
-        plot_equity(result["curves"], OUT_DIR / f"{label}_equity_curve.png")
+    latest_signal.to_csv(OUT_DIR / "latest_signal.csv", index=False, encoding="utf-8")
+    write_json(OUT_DIR / "latest_signal.json", latest_signal.iloc[0].to_dict())
+
+    train_result["curves"].to_csv(OUT_DIR / "train_equity_curve.csv", index=False, encoding="utf-8")
+    train_result["trades"].to_csv(OUT_DIR / "train_trade_log.csv", index=False, encoding="utf-8")
+    train_result["monthly"].to_csv(OUT_DIR / "train_monthly_returns.csv", index=False, encoding="utf-8")
+    train_result["metrics"].to_csv(OUT_DIR / "train_metrics.csv", index=False, encoding="utf-8")
+    plot_equity(train_result["curves"], OUT_DIR / "train_equity_curve.png")
 
     model.booster_.save_model(str(OUT_DIR / "lightgbm_model.txt"))
+    model.booster_.save_model(str(OUT_DIR / f"lightgbm_model_{latest_feature_date:%Y%m%d}.txt"))
     pd.DataFrame(
         {
             "feature": FEATURE_COLUMNS,
@@ -575,35 +648,32 @@ def main() -> None:
 
     summary = {
         "project": "LightGBM daily static IM teaching example",
-        "warning": "2025-07-01 to 2026-06-30 is observed retrospective OOS, not fresh unseen evidence.",
+        "warning": "Latest-row signal is a forecast for the next trading open to the second next trading open; that latest row is not used as a labeled training row unless its future target is already known.",
         "no_rf_features": True,
-        "params": PARAMS,
+        "params": active_params,
+        "min_child_samples_rule": f"round_half_up(train_rows * {MIN_CHILD_SAMPLES_RATE})",
         "feature_count": len(FEATURE_COLUMNS),
         "feature_columns": FEATURE_COLUMNS,
         "target_definition": "For features at T close, label T+1 open -> T+2 open return.",
+        "latest_feature_date": latest_feature_date,
+        "train_target_end": train_target_end,
         "train_target_entry_start": train["target_entry_date"].min(),
         "train_target_entry_end": train["target_entry_date"].max(),
         "train_target_exit_start": train["target_exit_date"].min(),
         "train_target_exit_end": train["target_exit_date"].max(),
         "train_rows": int(len(train)),
-        "oos_target_entry_start": oos["target_entry_date"].min(),
-        "oos_target_entry_end": oos["target_entry_date"].max(),
-        "oos_target_exit_start": oos["target_exit_date"].min(),
-        "oos_target_exit_end": oos["target_exit_date"].max(),
-        "oos_rows": int(len(oos)),
+        "latest_signal": latest_signal.iloc[0].to_dict(),
         "actual_tree_count": int(model.booster_.num_trees()),
         "classification": {
             "train": classification_metrics("train", train_pred),
-            "observed_oos": classification_metrics("observed_oos", oos_pred),
         },
         "backtest": {
             "train": train_result["metrics"].to_dict("records"),
-            "observed_oos": oos_result["metrics"].to_dict("records"),
         },
         "contract": meta.__dict__,
     }
     write_json(OUT_DIR / "summary.json", summary)
-    print(json.dumps(summary, ensure_ascii=False, indent=2, default=json_default))
+    print(json.dumps(json_sanitize(summary), ensure_ascii=False, indent=2, allow_nan=False, default=json_default))
 
 
 if __name__ == "__main__":
